@@ -22,20 +22,48 @@ ICU продає: 1058,09₴ | 13,65% SIM
 ICU купує: 1057,02₴ | 14,50% SIM"""
 
 
+# Ціна може містити нерозривний пробіл як роздільник тисяч: "1 065,53₴".
+_PRICE = r'([\d\s ]+(?:[,.]\d+)?)'
+_RATE  = r'([\d\s ]+(?:[,.]\d+)?)'
+ICU_SELL_RE = re.compile(
+    rf'ICU\s+продає:\s*{_PRICE}\s*₴\s*\|\s*{_RATE}\s*%\s*(\w+)',
+    re.IGNORECASE,
+)
+ICU_BUY_RE = re.compile(
+    rf'ICU\s+купує:\s*{_PRICE}\s*₴\s*\|\s*{_RATE}\s*%\s*(\w+)',
+    re.IGNORECASE,
+)
+
+
+def _icu_num(s: str) -> float:
+    """'1 065,53' / '1065.53' / '1 065,53' → 1065.53."""
+    return float(s.replace(' ', '').replace(' ', '').replace(',', '.'))
+
+
 def parse_icu_text(text: str) -> pd.DataFrame:
     """
     Parse raw ICU bot message into a DataFrame.
     Returns columns: isin, name, maturity, sell_price, sell_rate, sell_type,
                      buy_price, buy_rate, buy_type, is_flexible_fix
     """
-    blocks = re.split(r'\n---\n', text.strip())
+    # Нормалізуємо CRLF та CR (Telegram desktop / Windows clipboard).
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+    # Розбиваємо по `---` (з будь-яким пробільним матеріалом навколо).
+    # Якщо `---` відсутній — fallback на split за `ISIN:` lookahead.
+    if re.search(r'\n\s*---\s*\n', text):
+        blocks = re.split(r'\n\s*---\s*\n', text)
+    else:
+        blocks = re.split(r'(?=^ISIN:)', text, flags=re.MULTILINE)
+
     records = []
     for block in blocks:
         if 'ISIN' not in block:
             continue
         rec = {}
-        isin_m = re.search(r'ISIN:\s*/?(UA\w+)', block)
-        rec['isin'] = isin_m.group(1) if isin_m else None
+        isin_m = re.search(r'ISIN:\s*/?(UA\d{10})', block)
+        if not isin_m:
+            continue
+        rec['isin'] = isin_m.group(1)
 
         name_m = re.search(r'Назва:\s*([^\n]+)', block)
         raw_name = name_m.group(1).strip() if name_m else ''
@@ -45,31 +73,25 @@ def parse_icu_text(text: str) -> pd.DataFrame:
         mat_m = re.search(r'Дата погашення:\s*(\d{2}\.\d{2}\.\d{4})', block)
         rec['maturity'] = datetime.strptime(mat_m.group(1), '%d.%m.%Y').date() if mat_m else None
 
-        sell_m = re.search(r'ICU продає:\s*([\d,]+)₴\s*\|\s*([\d,]+)%\s*(\w+)', block)
+        sell_m = ICU_SELL_RE.search(block)
         if sell_m:
-            rec['sell_price'] = float(sell_m.group(1).replace(',', '.'))
-            rec['sell_rate'] = float(sell_m.group(2).replace(',', '.'))
-            rec['sell_type'] = sell_m.group(3)
+            rec['sell_price'] = _icu_num(sell_m.group(1))
+            rec['sell_rate']  = _icu_num(sell_m.group(2))
+            rec['sell_type']  = sell_m.group(3)
         else:
-            rec['sell_price'] = None
-            rec['sell_rate'] = None
-            rec['sell_type'] = None
+            rec['sell_price'] = rec['sell_rate'] = rec['sell_type'] = None
 
-        buy_m = re.search(r'ICU купує:\s*([\d,]+)₴\s*\|\s*([\d,]+)%\s*(\w+)', block)
+        buy_m = ICU_BUY_RE.search(block)
         if buy_m:
-            rec['buy_price'] = float(buy_m.group(1).replace(',', '.'))
-            rec['buy_rate'] = float(buy_m.group(2).replace(',', '.'))
-            rec['buy_type'] = buy_m.group(3)
+            rec['buy_price'] = _icu_num(buy_m.group(1))
+            rec['buy_rate']  = _icu_num(buy_m.group(2))
+            rec['buy_type']  = buy_m.group(3)
         else:
-            rec['buy_price'] = None
-            rec['buy_rate'] = None
-            rec['buy_type'] = None
+            rec['buy_price'] = rec['buy_rate'] = rec['buy_type'] = None
 
-        if rec['isin']:
-            records.append(rec)
+        records.append(rec)
 
-    df = pd.DataFrame(records)
-    return df
+    return pd.DataFrame(records).drop_duplicates('isin').reset_index(drop=True)
 
 
 def parse_ovdp_xlsx(file) -> pd.DataFrame:
@@ -105,13 +127,15 @@ def parse_ovdp_xlsx(file) -> pd.DataFrame:
 def merge_icu_ovdp(icu_df: pd.DataFrame, ovdp_df: pd.DataFrame) -> pd.DataFrame:
     """
     Merge ICU market data with OVDP registry data on ISIN.
+    Якщо в ICU немає `maturity` — підтягуємо з OVDP (`maturity_date`).
     """
     merged = icu_df.merge(
         ovdp_df[['isin', 'bond_type', 'nominal', 'currency',
-                 'issue_date', 'coupon_rate_pct', 'coupon_days', 'outstanding']],
+                 'issue_date', 'maturity_date',
+                 'coupon_rate_pct', 'coupon_days', 'outstanding']],
         on='isin',
-        how='left'
+        how='left',
     )
-    # fallback for maturity from ovdp if needed
-    merged['maturity'] = merged['maturity'].fillna(merged.get('maturity_date'))
+    if 'maturity' in merged.columns and 'maturity_date' in merged.columns:
+        merged['maturity'] = merged['maturity'].fillna(merged['maturity_date'])
     return merged

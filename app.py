@@ -194,11 +194,21 @@ with tab_market:
         st.stop()
 
     mdf = st.session_state.market_df.copy()
-    uah_df = mdf[mdf.get('currency', 'UAH').apply(
-        lambda x: str(x) == 'UAH') if 'currency' in mdf.columns else mdf.index].copy()
+    uah_df = mdf.copy()
 
     # ── Filters ──────────────────────────────────────────────────────────────
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 2])
+    col_f0, col_f1, col_f2, col_f3 = st.columns([1.4, 2, 2, 1.6])
+    with col_f0:
+        if 'currency' in uah_df.columns:
+            available_ccys = sorted(uah_df['currency'].dropna().astype(str).unique().tolist())
+            sel_ccys = st.multiselect(
+                "Валюта",
+                available_ccys,
+                default=available_ccys,   # за замовчуванням — всі (UAH+USD+EUR)
+                key="mkt_ccy",
+            )
+            if sel_ccys:
+                uah_df = uah_df[uah_df['currency'].astype(str).isin(sel_ccys)]
     with col_f1:
         if 'maturity' in uah_df.columns:
             mat_dates = uah_df['maturity'].dropna().unique()
@@ -651,7 +661,15 @@ with tab_analysis:
         pnl = row.get('Нереаліз. P&L, ₴')
         pnl_pct = row.get('Нереаліз. P&L, %')
         mat = row.get('Дата погашення')
-        ttm = float(row.get('До погашення, рок.', dur_pos) if 'До погашення, рок.' in row.index else dur_pos)
+        # TTM = роки до погашення (а не дюрація). Беремо з market_df,
+        # fallback — обчислюємо з дати погашення.
+        mrow_ttm = mdf_clean[mdf_clean['isin'] == isin]
+        if not mrow_ttm.empty and 'До погашення, рок.' in mrow_ttm.columns:
+            ttm = float(mrow_ttm.iloc[0].get('До погашення, рок.') or 0)
+        elif isinstance(mat, date):
+            ttm = max(0.0, (mat - today()).days / 365)
+        else:
+            ttm = dur_pos
 
         # Lookup market row for this isin
         mrow = mdf_clean[mdf_clean['isin'] == isin]
@@ -959,7 +977,8 @@ with tab_analysis:
     if 'Мод. дюрація' in portfolio_df.columns and 'Ринк. вартість, ₴' in portfolio_df.columns:
         port_mv = float(summary.get('Ринкова вартість портфеля, ₴', 0))
         port_mod_dur = float(summary.get('Серед. зважена мод. дюрація', 0))
-        port_conv = float(portfolio_df['Опуклість (Convexity)'].mean() if 'Опуклість (Convexity)' in portfolio_df.columns else 0)
+        # MV-weighted convexity (consistent з тим, як зважується duration / YTM).
+        port_conv = float(summary.get('Серед. зважена опуклість', 0))
 
         dy = shock_bp / 10000
         # ΔP ≈ -D_mod × ΔY + 0.5 × Convexity × (ΔY)²  (as fraction of price)

@@ -59,6 +59,8 @@ def build_portfolio_df(
         ytm = float(r.get('YTM / SIM, %', 0) or 0)
         annual_coupon_income = float(r.get('Річний купон, ₴', 0) or 0) * qty
 
+        conv = float(r.get('Опуклість (Convexity)', 0) or 0)
+
         rows.append({
             'ISIN': isin,
             'Назва': r.get('name') or '—',
@@ -74,6 +76,7 @@ def build_portfolio_df(
             'YTM/SIM ринк., %': ytm,
             'Дюрація Макколея, рок.': mac_dur,
             'Мод. дюрація': mod_dur,
+            'Опуклість (Convexity)': conv,
             'DV01 (портф.), ₴': round(total_dv01, 2),
             'Річний купон. дохід, ₴': round(annual_coupon_income, 2),
             'Дата погашення': r.get('maturity'),
@@ -92,11 +95,15 @@ def portfolio_summary(portfolio_df: pd.DataFrame) -> dict:
     total_dv01 = portfolio_df['DV01 (портф.), ₴'].sum()
     total_coupon = portfolio_df['Річний купон. дохід, ₴'].sum()
 
-    # Weighted average YTM
+    # Weighted average YTM / Duration / Convexity (MV-weighted, consistent set)
     weights = portfolio_df['Ринк. вартість, ₴'] / total_market if total_market else 1
-    wav_ytm = (portfolio_df['YTM/SIM ринк., %'] * weights).sum()
-    wav_dur = (portfolio_df['Дюрація Макколея, рок.'] * weights).sum()
+    wav_ytm    = (portfolio_df['YTM/SIM ринк., %'] * weights).sum()
+    wav_dur    = (portfolio_df['Дюрація Макколея, рок.'] * weights).sum()
     wav_moddur = (portfolio_df['Мод. дюрація'] * weights).sum()
+    if 'Опуклість (Convexity)' in portfolio_df.columns:
+        wav_conv = (portfolio_df['Опуклість (Convexity)'] * weights).sum()
+    else:
+        wav_conv = 0.0
 
     pnl_rows = portfolio_df['Нереаліз. P&L, ₴'].dropna()
     total_pnl = pnl_rows.sum() if not pnl_rows.empty else None
@@ -110,5 +117,6 @@ def portfolio_summary(portfolio_df: pd.DataFrame) -> dict:
         "Серед. зважений YTM, %": round(wav_ytm, 2),
         "Серед. зважена дюрація (Маккол.), рок.": round(wav_dur, 3),
         "Серед. зважена мод. дюрація": round(wav_moddur, 3),
+        "Серед. зважена опуклість": round(wav_conv, 3),
         "DV01 портфеля, ₴": round(total_dv01, 2),
     }
