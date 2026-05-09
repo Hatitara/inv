@@ -8,7 +8,7 @@ app.py — ОВДП Портфельний Менеджер (Streamlit)
   💼 Портфель  — введення / завантаження позицій
   📈 Аналітика — деталі по кожній позиції + cash flows
   🎯 Рекомендації — GAP-аналіз + сигнали + топ-N купити
-  ⚙️  Налаштування — параметри стратегії + завантаження ICU-даних
+  ⚙️  Налаштування — параметри стратегії + джерела даних
 """
 
 from __future__ import annotations
@@ -37,9 +37,8 @@ from config import (
 )
 from data_loader import (
     DEMO_BONDS, DEMO_PORTFOLIO,
-    load_fx_rates, load_nbu_key_rate,
-    merge_icu_market_data, parse_bond_registry_from_dict,
-    parse_icu_portfolio_csv, parse_icu_table, parse_portfolio_input,
+    load_fx_rates, load_minfin_bonds, load_nbu_key_rate,
+    parse_bond_registry_from_dict, parse_portfolio_csv, parse_portfolio_input,
 )
 from recommender import StrategyParams, run_recommendations
 
@@ -83,7 +82,6 @@ def _init_state():
         "inflation":      9.7,
         "settle_date":    date.today(),
         "data_loaded":    False,
-        "icu_df":         pd.DataFrame(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -316,7 +314,7 @@ with tab_portfolio:
 
     method = st.radio(
         "Спосіб введення портфеля",
-        ["✏️ Ввести вручну", "📋 Вставити CSV з ICU", "📁 Завантажити файл"],
+        ["✏️ Ввести вручну", "📁 Завантажити файл CSV/Excel"],
         horizontal=True,
     )
 
@@ -372,27 +370,16 @@ with tab_portfolio:
             S["portfolio_df"] = parse_portfolio_input(rows)
             st.success(f"✅ Збережено {len(S['portfolio_df'])} позицій")
 
-    elif method == "📋 Вставити CSV з ICU":
-        st.caption("Скопіюйте таблицю зі свого кабінету ICU (Ctrl+A → Ctrl+C) і вставте сюди")
-        raw = st.text_area("Вставте дані (tab або кома як роздільник)", height=200)
-        if st.button("📥 Імпортувати", type="primary") and raw.strip():
-            sep = "\t" if "\t" in raw else ","
-            S["portfolio_df"] = parse_icu_portfolio_csv(raw)
+    else:
+        st.caption("CSV або Excel з колонками: ISIN, кількість лотів, ціна купівлі %, дата купівлі")
+        uploaded = st.file_uploader("Оберіть файл", type=["csv", "xlsx", "xls"])
+        if uploaded and st.button("📥 Обробити файл", type="primary"):
+            raw = uploaded.read()
+            S["portfolio_df"] = parse_portfolio_csv(raw)
             if not S["portfolio_df"].empty:
                 st.success(f"✅ Імпортовано {len(S['portfolio_df'])} позицій")
             else:
                 st.error("Не вдалося розпізнати формат. Перевірте колонки: ISIN, кількість, ціна купівлі")
-
-    else:
-        uploaded = st.file_uploader("Завантажте CSV або Excel з ICU", type=["csv", "xlsx", "xls"])
-        if uploaded and st.button("📥 Обробити файл", type="primary"):
-            raw = uploaded.read()
-            ft  = "excel" if uploaded.name.endswith((".xlsx", ".xls")) else "csv"
-            S["portfolio_df"] = parse_icu_portfolio_csv(
-                raw.decode("utf-8", errors="replace") if ft == "csv" else raw
-            )
-            if not S["portfolio_df"].empty:
-                st.success(f"✅ Імпортовано {len(S['portfolio_df'])} позицій")
 
     # Показуємо поточний портфель
     if not S["portfolio_df"].empty:
@@ -708,11 +695,24 @@ with tab_settings:
     with st.expander("📋 Реєстр облігацій (dim_bonds)", expanded=True):
         reg_method = st.radio(
             "Джерело даних",
-            ["Ввести вручну / JSON", "Завантажити CSV", "ICU Excel-звіт"],
+            ["🌐 Завантажити з Мінфіну", "Ввести вручну / JSON", "Завантажити CSV"],
             horizontal=True,
         )
 
-        if reg_method == "Ввести вручну / JSON":
+        if reg_method == "🌐 Завантажити з Мінфіну":
+            st.caption("Завантажує актуальні ОВДП з API Мінфіну (результати аукціонів). Потребує інтернет.")
+            col_lim, _ = st.columns([1, 3])
+            limit = col_lim.number_input("Кількість аукціонів", min_value=20, max_value=500, value=100, step=20)
+            if st.button("🔄 Завантажити з Мінфіну", type="primary"):
+                with st.spinner("Підключення до minfin.gov.ua..."):
+                    raw_list = load_minfin_bonds(limit=int(limit))
+                if raw_list.empty:
+                    st.error("Мінфін API недоступний або повернув порожній список. Спробуйте ввести дані вручну або завантажте CSV.")
+                else:
+                    S["bonds_df"] = parse_bond_registry_from_dict(raw_list.to_dict("records"))
+                    st.success(f"✅ Завантажено {len(S['bonds_df'])} активних ОВДП з Мінфіну")
+
+        elif reg_method == "Ввести вручну / JSON":
             default_json = """[
   {"isin":"UA4000228894","currency":"UAH","face_value":1000,"coupon_rate_pct":14.5,
    "coupon_freq":4,"day_count":"ACT/ACT","issue_date":"2023-10-15","maturity_date":"2025-10-15",
@@ -728,39 +728,13 @@ with tab_settings:
                 except Exception as e:
                     st.error(f"Помилка парсингу JSON: {e}")
 
-        elif reg_method == "Завантажити CSV":
+        else:  # Завантажити CSV
+            st.caption("CSV повинен містити колонки: isin, currency, face_value, coupon_rate_pct, coupon_freq, issue_date, maturity_date, market_price_pct")
             up = st.file_uploader("CSV з параметрами облігацій", type=["csv"])
             if up and st.button("📥 Обробити"):
                 df_raw = pd.read_csv(up)
                 S["bonds_df"] = parse_bond_registry_from_dict(df_raw.to_dict("records"))
                 st.success(f"✅ {len(S['bonds_df'])} паперів")
-
-        else:  # ICU Excel
-            up = st.file_uploader("Excel з ICU (щотижневий звіт)", type=["xlsx","xls"])
-            if up and st.button("📥 Обробити ICU Excel"):
-                raw = up.read()
-                icu_df = parse_icu_table(raw, file_type="excel")
-                if not icu_df.empty and not S["bonds_df"].empty:
-                    S["bonds_df"] = merge_icu_market_data(S["bonds_df"], icu_df)
-                    st.success("ICU-котировки оновлено!")
-                elif not icu_df.empty:
-                    st.info("Спочатку завантажте базовий реєстр паперів, потім злийте з ICU")
-
-    # ICU ринкові котировки
-    with st.expander("📊 Ринкові котировки ICU"):
-        st.caption(
-            "Таблицю котировок з icu.ua можна вставити як tab-separated текст "
-            "або завантажити CSV/Excel"
-        )
-        icu_paste = st.text_area("Вставити котировки ICU:", height=150)
-        if st.button("🔄 Оновити котировки") and icu_paste.strip():
-            sep = "paste" if "\t" in icu_paste else "csv"
-            icu_df = parse_icu_table(icu_paste, file_type=sep)
-            if not icu_df.empty and not S["bonds_df"].empty:
-                S["bonds_df"] = merge_icu_market_data(S["bonds_df"], icu_df)
-                st.success(f"✅ Котировки оновлено: {len(icu_df)} записів")
-            else:
-                st.warning("Перевірте формат або завантажте реєстр спочатку")
 
     # Поточний реєстр
     if not S["bonds_df"].empty:
@@ -775,5 +749,5 @@ with tab_settings:
             )
 
     st.divider()
-    st.caption("ℹ️ Дані НБУ API: bank.gov.ua | Дані ICU: icu.ua | Мінфін: minfin.gov.ua")
+    st.caption("ℹ️ Дані НБУ API: bank.gov.ua | Реєстр ОВДП: minfin.gov.ua")
     st.caption("⚠️ Військовий збір 1.5% враховано у всіх розрахунках YTM. ПДФО = 0% (ОВДП звільнені)")

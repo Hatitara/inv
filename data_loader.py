@@ -4,9 +4,9 @@ data_loader.py
 Завантаження всіх зовнішніх даних:
   - Курси НБУ (поточні + на дату)
   - Облікова ставка НБУ
-  - Реєстр ОВДП (ручне введення або ICU CSV/Excel)
+  - Реєстр ОВДП з API Мінфіну (аукціонні результати)
+  - Реєстр ОВДП (ручне введення або CSV)
   - Результати аукціонів Мінфіну
-  - Ринкові котировки ICU (таблиця YTM з їхнього сайту / вставлена вручну)
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import pandas as pd
 import requests
 
 from config import (
-    FALLBACK_FX, ICU_COLUMN_MAP, MINFIN_AUCTIONS_URL,
+    FALLBACK_FX, MINFIN_AUCTIONS_URL,
     NBU_FX_DATE, NBU_FX_TODAY, NBU_KEY_RATE,
 )
 
@@ -125,7 +125,7 @@ def load_nbu_key_rate() -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. РЕЄСТР ОБЛІГАЦІЙ — ручне введення / ICU Excel / CSV
+# 3. РЕЄСТР ОБЛІГАЦІЙ — ручне введення або CSV
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_bond_registry_from_dict(bonds: List[Dict]) -> pd.DataFrame:
@@ -163,7 +163,7 @@ def parse_bond_registry_from_dict(bonds: List[Dict]) -> pd.DataFrame:
                 "maturity_date":    maturity_dt,
                 "coupon_pay_dates": pay_dates,   # List[date]
                 "is_discount":      is_discount,
-                # Ринкові дані (можуть бути заповнені пізніше з ICU)
+                # Ринкові дані (аукціонна ціна / YTM з Мінфіну)
                 "market_price_pct": float(b.get("market_price_pct", 100.0)),
                 "market_ytm_pct":   float(b.get("market_ytm_pct", 0.0)),
                 "volume_mln_uah":   float(b.get("volume_mln_uah", 0.0)),
@@ -181,88 +181,115 @@ def parse_bond_registry_from_dict(bonds: List[Dict]) -> pd.DataFrame:
     return df
 
 
-def parse_icu_table(raw: str | bytes, file_type: str = "csv") -> pd.DataFrame:
+def load_minfin_bonds(limit: int = 100) -> pd.DataFrame:
     """
-    Парсить таблицю з ICU Research (вставлена або завантажена).
-    file_type: 'csv' | 'excel' | 'paste' (tab-separated текст)
+    Завантажує список активних ОВДП з API Мінфіну (результати аукціонів).
+    Повертає список словників, готових для parse_bond_registry_from_dict().
 
-    Повертає DataFrame з колонками:
-      isin, maturity_date, coupon_rate_pct, ytm_icu_pct,
-      clean_price_pct, accrued_int, volume_mln
+    API може повертати {'data': [...]} або просто [...].
+    Дедублікує по ISIN, залишаючи найновіший аукціон.
     """
-    try:
-        if file_type == "excel":
-            df = pd.read_excel(io.BytesIO(raw) if isinstance(raw, bytes) else raw,
-                               header=0)
-        elif file_type in ("csv", "paste"):
-            sep = "\t" if file_type == "paste" else ","
-            df = pd.read_csv(
-                io.StringIO(raw if isinstance(raw, str) else raw.decode("utf-8")),
-                sep=sep,
-            )
-        else:
-            raise ValueError(f"Невідомий тип файлу: {file_type}")
-
-        # Перейменовуємо колонки за картою
-        rename_map = {}
-        for src, dst in ICU_COLUMN_MAP.items():
-            for col in df.columns:
-                if src.lower() in col.lower():
-                    rename_map[col] = dst
-                    break
-        df = df.rename(columns=rename_map)
-
-        # Нормалізація дат
-        if "maturity_date" in df.columns:
-            df["maturity_date"] = pd.to_datetime(
-                df["maturity_date"], dayfirst=True, errors="coerce"
-            )
-
-        # Числові поля
-        for col in ["coupon_rate_pct", "ytm_icu_pct", "clean_price_pct",
-                    "accrued_int", "volume_mln"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col].astype(str).str.replace(",", ".").str.replace("%", ""),
-                    errors="coerce",
-                )
-
-        log.info("ICU-таблиця: %d рядків", len(df))
-        return df
-
-    except Exception as e:
-        log.error("Помилка парсингу ICU-даних: %s", e)
+    base = MINFIN_AUCTIONS_URL.split("?")[0]
+    data = _http.get(f"{base}?limit={limit}")
+    if not data:
+        log.warning("Мінфін API недоступний")
         return pd.DataFrame()
 
+    if isinstance(data, dict):
+        records_raw = (
+            data.get("data") or data.get("items") or
+            data.get("results") or data.get("auctions") or []
+        )
+    elif isinstance(data, list):
+        records_raw = data
+    else:
+        log.error("Мінфін API: неочікуваний формат відповіді")
+        return pd.DataFrame()
 
-def merge_icu_market_data(
-    bonds_df: pd.DataFrame,
-    icu_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Зливає ринкові котировки ICU в реєстр облігацій по ISIN.
-    ICU-дані мають пріоритет над ручними ринковими цінами.
-    """
-    if icu_df.empty or "isin" not in icu_df.columns:
-        return bonds_df
+    today = date.today()
+    bonds: List[Dict] = []
 
-    icu_cols = [c for c in ["isin", "ytm_icu_pct", "clean_price_pct",
-                             "accrued_int", "volume_mln"]
-                if c in icu_df.columns]
-    merged = bonds_df.merge(icu_df[icu_cols], on="isin", how="left", suffixes=("", "_icu"))
+    for r in records_raw:
+        try:
+            isin = str(r.get("isin") or r.get("ISIN") or "").strip().upper()
+            if len(isin) < 12:
+                continue
 
-    if "ytm_icu_pct" in merged.columns:
-        merged["market_ytm_pct"] = merged["ytm_icu_pct"].fillna(merged["market_ytm_pct"])
-    if "clean_price_pct" in merged.columns:
-        merged["market_price_pct"] = merged["clean_price_pct"].fillna(merged["market_price_pct"])
+            mat_raw = (r.get("maturity") or r.get("date_maturity") or
+                       r.get("maturityDate") or r.get("redemption_date") or "")
+            maturity = pd.to_datetime(mat_raw, dayfirst=False, errors="coerce")
+            if pd.isnull(maturity) or maturity.date() <= today:
+                continue  # пропускаємо погашені
 
-    log.info("ICU-дані злиті: %d паперів отримали котировки",
-             merged["market_ytm_pct"].notna().sum())
-    return merged
+            issue_raw = (r.get("date") or r.get("date_auction") or
+                         r.get("issueDate") or r.get("placement_date") or "")
+            issue = pd.to_datetime(issue_raw, dayfirst=False, errors="coerce")
+            if pd.isnull(issue):
+                issue = pd.Timestamp(today)
+
+            currency = str(r.get("currency") or r.get("ccy") or "UAH").upper()
+            if currency not in ("UAH", "USD", "EUR"):
+                currency = "UAH"
+
+            coupon = float(r.get("coupon") or r.get("coupon_rate") or
+                           r.get("rate") or r.get("couponRate") or 0.0)
+
+            freq_raw = (r.get("period") or r.get("coupon_freq") or
+                        r.get("frequency") or r.get("couponFreq"))
+            try:
+                freq = int(freq_raw) if freq_raw is not None else (4 if coupon > 0 else 0)
+            except (ValueError, TypeError):
+                freq = 4 if coupon > 0 else 0
+
+            face = float(r.get("face") or r.get("nominal") or
+                         r.get("face_value") or r.get("faceValue") or 1000.0)
+
+            price = float(r.get("price") or r.get("price_avg") or
+                          r.get("weighted_price") or r.get("avgPrice") or 100.0)
+            if price <= 0:
+                price = 100.0
+
+            ytm_raw = (r.get("yield") or r.get("ytm") or
+                       r.get("yield_avg") or r.get("avgYield") or 0.0)
+            ytm_pct = float(ytm_raw) if ytm_raw else 0.0
+
+            amount = float(r.get("amount") or r.get("volume") or
+                           r.get("amount_placed") or r.get("placedAmount") or 0.0)
+            volume_mln = round(amount / 1_000_000, 1) if amount > 0 else 0.0
+
+            code = str(r.get("code") or r.get("series") or
+                       r.get("series_code") or r.get("seriesCode") or isin)
+
+            bonds.append({
+                "isin":             isin,
+                "series_code":      code,
+                "currency":         currency,
+                "face_value":       face,
+                "coupon_rate_pct":  coupon,
+                "coupon_freq":      freq,
+                "day_count":        "ACT/ACT",
+                "issue_date":       issue.strftime("%Y-%m-%d"),
+                "maturity_date":    maturity.strftime("%Y-%m-%d"),
+                "market_price_pct": price,
+                "market_ytm_pct":   ytm_pct,
+                "volume_mln_uah":   volume_mln,
+            })
+        except (TypeError, ValueError, KeyError) as e:
+            log.debug("Пропускаю запис Мінфіну: %s", e)
+
+    if not bonds:
+        log.warning("Мінфін: не знайдено активних ОВДП (або всі погашені)")
+        return pd.DataFrame()
+
+    # Дедублікація по ISIN — залишаємо найновіший аукціон
+    df_raw = pd.DataFrame(bonds)
+    df_raw = df_raw.drop_duplicates("isin", keep="last").reset_index(drop=True)
+    log.info("Мінфін: %d активних ОВДП завантажено", len(df_raw))
+    return df_raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. ПОРТФЕЛЬ КОРИСТУВАЧА — введення вручну або ICU-формат
+# 4. ПОРТФЕЛЬ КОРИСТУВАЧА — введення вручну або CSV-файл
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_portfolio_input(rows: List[Dict]) -> pd.DataFrame:
@@ -304,20 +331,35 @@ def parse_portfolio_input(rows: List[Dict]) -> pd.DataFrame:
     return df
 
 
-def parse_icu_portfolio_csv(raw: str) -> pd.DataFrame:
+def parse_portfolio_csv(raw: str | bytes) -> pd.DataFrame:
     """
-    Парсить експорт портфеля з ICU (формат їхнього кабінету).
-    Автоматично нормалізує різні варіанти заголовків.
+    Парсить CSV/Excel-файл з позиціями портфеля.
+    Автоматично розпізнає заголовки (ISIN, кількість, ціна купівлі, дата).
     """
     try:
-        df = pd.read_csv(io.StringIO(raw), sep=None, engine="python")
-        col_map = {}
+        if isinstance(raw, bytes):
+            # Пробуємо Excel
+            try:
+                df = pd.read_excel(io.BytesIO(raw), header=0)
+            except Exception:
+                df = pd.read_csv(io.StringIO(raw.decode("utf-8", errors="replace")),
+                                 sep=None, engine="python")
+        else:
+            df = pd.read_csv(io.StringIO(raw), sep=None, engine="python")
+
+        col_map: Dict[str, str] = {}
         for col in df.columns:
             cl = col.lower().strip()
-            if "isin" in cl:                           col_map[col] = "isin"
-            elif any(x in cl for x in ["кільк", "lots", "кол-во", "облігацій"]): col_map[col] = "amount_lots"
-            elif any(x in cl for x in ["ціна", "price", "курс куп"]):            col_map[col] = "avg_buy_price_pct"
-            elif any(x in cl for x in ["дата", "date", "куплено"]):              col_map[col] = "buy_date"
+            if "isin" in cl:
+                col_map[col] = "isin"
+            elif any(x in cl for x in ["кільк", "lots", "кол-во", "облігацій", "кількість"]):
+                col_map[col] = "amount_lots"
+            elif any(x in cl for x in ["ціна", "price", "курс куп", "avg", "buy_price"]):
+                col_map[col] = "avg_buy_price_pct"
+            elif any(x in cl for x in ["дата", "date", "куплено"]):
+                col_map[col] = "buy_date"
+            elif any(x in cl for x in ["комісія", "commission"]):
+                col_map[col] = "commission_uah"
         df = df.rename(columns=col_map)
 
         for c in ["amount_lots", "avg_buy_price_pct"]:
@@ -327,7 +369,7 @@ def parse_icu_portfolio_csv(raw: str) -> pd.DataFrame:
                 )
         return parse_portfolio_input(df.to_dict("records"))
     except Exception as e:
-        log.error("Помилка парсингу ICU-портфеля: %s", e)
+        log.error("Помилка парсингу файлу портфеля: %s", e)
         return pd.DataFrame()
 
 

@@ -15,10 +15,6 @@ NBU_KEY_RATE  = "https://bank.gov.ua/NBUStatService/v1/statdirectory/NBUfixrate?
 # Мінфін — результати аукціонів ОВДП (публічний JSON)
 MINFIN_AUCTIONS_URL = "https://www.minfin.gov.ua/api/ovdp/auctions?limit=20"
 
-# ICU Research: публічна сторінка з таблицею доходностей
-# Якщо ICU заблокований — використовується ручне введення
-ICU_YIELDS_URL = "https://icu.ua/api/bonds/yields"   # неофіційний endpoint
-
 # ── Дефолтні FX (fallback якщо НБУ недоступний) ──────────────────────────────
 FALLBACK_FX = {"UAH": 1.0, "USD": 41.0, "EUR": 44.5}
 
@@ -46,13 +42,3 @@ APP_TITLE   = "ОВДП Портфельний Менеджер"
 PAGE_ICON   = "🇺🇦"
 THEME_COLOR = "#1A5276"
 
-# ── Колонки ICU-звіту (якщо вставляють як CSV/Excel) ─────────────────────────
-ICU_COLUMN_MAP = {
-    "ISIN":           "isin",
-    "Купон, %":       "coupon_rate_pct",
-    "Погашення":      "maturity_date",
-    "YTM, %":         "ytm_icu_pct",
-    "Ціна чиста, %":  "clean_price_pct",
-    "НКД":            "accrued_int",
-    "Обсяг, млн грн": "volume_mln",
-}
