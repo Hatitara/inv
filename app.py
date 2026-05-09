@@ -40,6 +40,10 @@ from data_loader import (
     load_fx_rates, load_minfin_bonds, load_nbu_key_rate,
     parse_bond_registry_from_dict, parse_portfolio_csv, parse_portfolio_input,
 )
+from manual_input import (
+    merge_icu_into_registry, parse_icu_telegram,
+    parse_manual_portfolio, parse_nbu_ovdp_excel,
+)
 from recommender import StrategyParams, run_recommendations
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,18 +360,25 @@ with tab_portfolio:
             },
         )
 
+        st.caption("💡 Якщо лишити «Ціна купівлі, %» = 100, автоматично підтягнеться ринкова з реєстру (ICU/NBU).")
+
         if st.button("💾 Зберегти портфель", type="primary"):
             rows = []
             for _, r in edited.iterrows():
-                if str(r.get("ISIN", "")).strip():
-                    rows.append({
-                        "isin":              str(r["ISIN"]).strip().upper(),
-                        "amount_lots":       r["Кількість лотів"],
-                        "avg_buy_price_pct": r["Ціна купівлі, %"],
-                        "buy_date":          r["Дата купівлі"],
-                        "commission_uah":    r.get("Комісія UAH", 0),
-                    })
-            S["portfolio_df"] = parse_portfolio_input(rows)
+                if not str(r.get("ISIN", "")).strip():
+                    continue
+                price = r["Ціна купівлі, %"]
+                # 100.0 → "не задано", тягнемо з реєстру
+                row = {
+                    "isin":           str(r["ISIN"]).strip().upper(),
+                    "amount_lots":    r["Кількість лотів"],
+                    "buy_date":       r["Дата купівлі"],
+                    "commission_uah": r.get("Комісія UAH", 0),
+                }
+                if price and float(price) != 100.0:
+                    row["avg_buy_price_pct"] = price
+                rows.append(row)
+            S["portfolio_df"] = parse_manual_portfolio(rows, registry_df=S["bonds_df"])
             st.success(f"✅ Збережено {len(S['portfolio_df'])} позицій")
 
     else:
@@ -695,7 +706,8 @@ with tab_settings:
     with st.expander("📋 Реєстр облігацій (dim_bonds)", expanded=True):
         reg_method = st.radio(
             "Джерело даних",
-            ["🌐 Завантажити з Мінфіну", "Ввести вручну / JSON", "Завантажити CSV"],
+            ["🌐 Завантажити з Мінфіну", "📊 NBU Excel", "💬 ICU котировки",
+             "Ввести вручну / JSON", "Завантажити CSV"],
             horizontal=True,
         )
 
@@ -711,6 +723,58 @@ with tab_settings:
                 else:
                     S["bonds_df"] = parse_bond_registry_from_dict(raw_list.to_dict("records"))
                     st.success(f"✅ Завантажено {len(S['bonds_df'])} активних ОВДП з Мінфіну")
+
+        elif reg_method == "📊 NBU Excel":
+            st.caption(
+                "Excel-експорт з реєстру ОВДП НБУ "
+                "(bank.gov.ua/ua/markets/ovdp/search → Завантажити)."
+            )
+            up_nbu = st.file_uploader("Excel-файл NBU", type=["xlsx", "xls"], key="nbu_xlsx")
+            if up_nbu and st.button("📥 Імпортувати NBU Excel", type="primary"):
+                with st.spinner("Парсинг NBU Excel..."):
+                    new_df = parse_nbu_ovdp_excel(up_nbu.read())
+                if new_df.empty:
+                    st.error("Не вдалося розпізнати таблицю. Перевірте формат файлу.")
+                else:
+                    S["bonds_df"] = new_df
+                    st.success(f"✅ Імпортовано {len(new_df)} ОВДП з NBU Excel")
+
+        elif reg_method == "💬 ICU котировки":
+            st.caption(
+                "Вставте повідомлення з Telegram-бота ICU. Котировки злиються "
+                "з поточним реєстром за ISIN (потрібен попередньо завантажений реєстр)."
+            )
+            icu_text = st.text_area(
+                "Текст повідомлення з бота ICU:",
+                height=300,
+                placeholder="ISIN: /UA4000231559\nНазва: Джарилгач\nДата погашення: 10.06.2026\n"
+                            "ICU продає: 1065,53₴ | 13,50% SIM\nICU купує: 1064,66₴ | 14,50% SIM\n---\n...",
+            )
+            side = st.radio(
+                "Сторона котировки",
+                ["ask (ICU продає)", "bid (ICU купує)"],
+                horizontal=True,
+                help="ask — за якою ви купуєте; bid — за якою продаєте.",
+            )
+            if st.button("📥 Імпортувати ICU котировки", type="primary"):
+                if S["bonds_df"].empty:
+                    st.warning("Спочатку завантажте реєстр (Мінфін / NBU Excel / JSON).")
+                elif not icu_text.strip():
+                    st.warning("Вставте текст повідомлення.")
+                else:
+                    icu_df = parse_icu_telegram(icu_text)
+                    if icu_df.empty:
+                        st.error("У тексті не знайдено жодного ISIN. Перевірте формат.")
+                    else:
+                        side_key = "ask" if side.startswith("ask") else "bid"
+                        S["bonds_df"] = merge_icu_into_registry(
+                            S["bonds_df"], icu_df, side=side_key,
+                        )
+                        n_quoted = (S["bonds_df"]["market_ytm_pct"] > 0).sum()
+                        st.success(
+                            f"✅ ICU: {len(icu_df)} котировок розпізнано, "
+                            f"{n_quoted} паперів реєстру оновлено."
+                        )
 
         elif reg_method == "Ввести вручну / JSON":
             default_json = """[
