@@ -633,8 +633,8 @@ with tab_analysis:
             mdf_clean[col] = pd.to_numeric(mdf_clean[col], errors='coerce')
 
     market_available = mdf_clean[mdf_clean['sell_price'].notna()].copy()
-    if avoid_flex:
-        market_available = market_available[~market_available.get('is_flexible_fix', pd.Series(False, index=market_available.index)).fillna(False)]
+    if avoid_flex and 'is_flexible_fix' in market_available.columns:
+        market_available = market_available[~market_available['is_flexible_fix'].fillna(False)]
 
     port_ytm_avg = summary.get('Серед. зважений YTM, %', 0)
     port_dur_avg = summary.get('Серед. зважена дюрація (Маккол.), рок.', 0)
@@ -705,146 +705,178 @@ with tab_analysis:
 
     st.divider()
 
-    # ── 4. Swap recommendations ──────────────────────────────────────────────
+    # ── 4. Pool-based rebalancing ─────────────────────────────────────────────
     st.subheader("🔄 Рекомендації щодо ребалансування")
+
+    # Separate flagged (to sell) and clean (to keep) positions
+    flagged_issues = [i for i in issues if i['flags']]
+    clean_issues   = [i for i in issues if not i['flags']]
 
     if market_available.empty:
         st.info("Немає доступних альтернатив на ринку ICU для порівняння.")
+    elif not flagged_issues:
+        st.success("✅ Усі позиції відповідають профілю — ребалансування не потрібне.")
     else:
-        # Filter market candidates to match investor profile
-        candidates = market_available.copy()
+        import plotly.graph_objects as go
 
-        # Must have yield data
-        candidates = candidates[candidates['sell_rate'].notna()]
-        candidates['sell_rate'] = pd.to_numeric(candidates['sell_rate'], errors='coerce')
-        candidates['Дюрація Макколея, рок.'] = pd.to_numeric(candidates.get('Дюрація Макколея, рок.'), errors='coerce')
+        # ── Step 1: Calculate the cash pool from selling flagged positions ───
+        sell_pool_uah = sum(i['mv'] for i in flagged_issues)
 
-        # Target yield filter (±1% band)
-        candidates = candidates[candidates['sell_rate'] >= target_ytm - 1.0]
+        st.markdown("#### 📤 Крок 1 — Що продаємо")
+        sell_rows = []
+        for i in flagged_issues:
+            sell_rows.append({
+                'ISIN': i['isin'],
+                'Назва': i['name'],
+                'YTM/SIM, %': i['ytm'],
+                'Дюрація, рок.': i['dur'],
+                'Ринк. вартість, ₴': i['mv'],
+                'Причини': ' | '.join(i['flags']),
+            })
+        sell_df_display = pd.DataFrame(sell_rows)
+        st.dataframe(sell_df_display, hide_index=True, use_container_width=True,
+                     column_config={
+                         'YTM/SIM, %': st.column_config.NumberColumn(format="%.2f%%"),
+                         'Дюрація, рок.': st.column_config.NumberColumn(format="%.2f"),
+                         'Ринк. вартість, ₴': st.column_config.NumberColumn(format="₴%.2f"),
+                     })
 
-        # Duration filter
-        candidates = candidates[candidates['Дюрація Макколея, рок.'] <= max_dur_allowed]
-
-        # Exclude ISINs already in portfolio
-        portfolio_isins = set(portfolio_df['ISIN'].tolist())
-        candidates_not_held = candidates[~candidates['isin'].isin(portfolio_isins)]
-
-        swap_suggestions = []
-
-        for iss in issues:
-            if not iss['flags']:
-                continue
-            isin = iss['isin']
-            ytm_cur = iss['ytm']
-            dur_cur = iss['dur']
-
-            # Find better candidates: higher YTM, better duration fit, not same ISIN
-            cands = candidates_not_held.copy()
-            if cands.empty:
-                continue
-
-            # Score candidates: reward YTM above current & target, penalise duration deviation from horizon
-            cands = cands.copy()
-            cands['ytm_score'] = cands['sell_rate'] - ytm_cur     # positive = better yield
-            target_dur = min(horizon_years * 0.8, max_dur_allowed)
-            cands['dur_score'] = -abs(cands['Дюрація Макколея, рок.'].fillna(9) - target_dur)
-            cands['total_score'] = cands['ytm_score'] * 0.6 + cands['dur_score'] * 0.4
-            top = cands.nlargest(3, 'total_score')
-
-            for _, alt in top.iterrows():
-                alt_ytm = float(alt['sell_rate'])
-                alt_dur = float(alt.get('Дюрація Макколея, рок.') or 0)
-                ytm_delta = alt_ytm - ytm_cur
-                swap_suggestions.append({
-                    'sell_isin': isin,
-                    'sell_name': iss['name'],
-                    'sell_ytm': ytm_cur,
-                    'sell_dur': dur_cur,
-                    'sell_mv': iss['mv'],
-                    'buy_isin': alt['isin'],
-                    'buy_name': alt.get('name') or alt['isin'],
-                    'buy_ytm': alt_ytm,
-                    'buy_dur': alt_dur,
-                    'buy_price': float(alt.get('sell_price') or 0),
-                    'buy_maturity': alt.get('maturity'),
-                    'ytm_delta': ytm_delta,
-                    'flags': iss['flags'],
-                })
-
-        # De-duplicate: one best swap per sell ISIN
-        seen_sells = {}
-        for s in swap_suggestions:
-            k = s['sell_isin']
-            if k not in seen_sells or s['ytm_delta'] > seen_sells[k]['ytm_delta']:
-                seen_sells[k] = s
-
-        best_swaps = list(seen_sells.values())
-
-        if not best_swaps:
-            st.success(
-                "✅ На поточному ринку ICU немає кандидатів, що суттєво покращать ваш портфель "
-                "відповідно до заданих параметрів."
-            )
-        else:
-            st.markdown(
-                f"Знайдено **{len(best_swaps)}** потенційних замін. "
-                "Оцінка базується на покращенні YTM та відповідності дюрації горизонту інвестора."
-            )
-            for s in sorted(best_swaps, key=lambda x: -x['ytm_delta']):
-                ytm_delta = s['ytm_delta']
-                delta_color = "#66bb6a" if ytm_delta >= 0 else "#ef5350"
-                delta_sign = "+" if ytm_delta >= 0 else ""
-                mat_str = s['buy_maturity'].strftime('%d.%m.%Y') if isinstance(s['buy_maturity'], date) else "—"
-
-                with st.container():
-                    st.markdown(f"""
-<div style="background:#1e3a5f; border-radius:10px; padding:16px 20px; margin-bottom:14px; border-left:4px solid {delta_color};">
-  <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
-    <div>
-      <span style="color:#90caf9; font-size:0.8rem;">ПРОДАТИ</span><br>
-      <b style="font-size:1.05rem;">{s['sell_name']}</b>
-      <span style="color:#aaa; font-size:0.82rem;"> / {s['sell_isin']}</span><br>
-      <span style="color:#ccc; font-size:0.85rem;">YTM {s['sell_ytm']:.2f}% &nbsp;·&nbsp; Дюрація {s['sell_dur']:.2f} рок. &nbsp;·&nbsp; ₴{s['sell_mv']:,.0f}</span>
-    </div>
-    <div style="font-size:1.6rem; color:{delta_color}; font-weight:900; align-self:center;">→</div>
-    <div>
-      <span style="color:#a5d6a7; font-size:0.8rem;">КУПИТИ</span><br>
-      <b style="font-size:1.05rem;">{s['buy_name']}</b>
-      <span style="color:#aaa; font-size:0.82rem;"> / {s['buy_isin']}</span><br>
-      <span style="color:#ccc; font-size:0.85rem;">YTM {s['buy_ytm']:.2f}% &nbsp;·&nbsp; Дюрація {s['buy_dur']:.2f} рок. &nbsp;·&nbsp; Погашення {mat_str} &nbsp;·&nbsp; Ціна ICU ₴{s['buy_price']:.2f}</span>
-    </div>
-    <div style="text-align:right; align-self:center;">
-      <span style="color:{delta_color}; font-size:1.3rem; font-weight:700;">{delta_sign}{ytm_delta:.2f}%</span><br>
-      <span style="color:#aaa; font-size:0.75rem;">Δ YTM</span>
-    </div>
-  </div>
-  <div style="margin-top:10px; color:#b0bec5; font-size:0.82rem;">
-    {'&nbsp;&nbsp;'.join([f'<span style="background:#263238; border-radius:4px; padding:2px 7px;">{f}</span>' for f in s['flags']])}
-  </div>
+        st.markdown(f"""
+<div class='metric-card' style="border-left-color:#ef5350;">
+  <h4>💰 Вивільнений пул коштів</h4>
+  <p>₴{sell_pool_uah:,.2f}</p>
 </div>""", unsafe_allow_html=True)
 
         st.divider()
 
-        # ── 5. Rebalanced portfolio preview ─────────────────────────────────
-        st.subheader("📐 Прогноз портфеля після ребалансування")
-        st.caption(
-            "Нижче показано, як зміниться агрегований профіль портфеля, якщо ви виконаєте всі рекомендовані заміни."
-        )
+        # ── Step 2: Score all market candidates not already held (and not being sold) ──
+        st.markdown("#### 📥 Крок 2 — Куди вкладаємо")
 
-        if best_swaps:
-            # Build simulated holdings
+        sell_isins = set(i['isin'] for i in flagged_issues)
+        keep_isins = set(i['isin'] for i in clean_issues)
+        all_held   = sell_isins | keep_isins
+
+        candidates = market_available.copy()
+        candidates = candidates[candidates['sell_rate'].notna()]
+        candidates['sell_rate'] = pd.to_numeric(candidates['sell_rate'], errors='coerce')
+        candidates['Дюрація Макколея, рок.'] = pd.to_numeric(candidates['Дюрація Макколея, рок.'], errors='coerce')
+        candidates['sell_price'] = pd.to_numeric(candidates['sell_price'], errors='coerce')
+
+        # Exclude currently held ISINs (both kept and sold)
+        candidates = candidates[~candidates['isin'].isin(all_held)]
+
+        # Duration: respect both risk tolerance and horizon
+        effective_max_dur = min(max_dur_allowed, horizon_years * 1.1)
+        candidates = candidates[candidates['Дюрація Макколея, рок.'] <= effective_max_dur]
+
+        # Minimum yield filter
+        candidates = candidates[candidates['sell_rate'] >= target_ytm - 1.0]
+
+        if candidates.empty:
+            st.warning(
+                "На ринку ICU немає підходящих кандидатів для поточних параметрів профілю. "
+                "Спробуйте розширити горизонт або знизити цільовий YTM."
+            )
+        else:
+            # Score: 60% YTM vs target, 40% duration fit vs ideal
+            target_dur_ideal = horizon_years * 0.8
+            candidates = candidates.copy()
+            candidates['ytm_score'] = (candidates['sell_rate'] - target_ytm) / target_ytm
+            candidates['dur_score'] = -abs(candidates['Дюрація Макколея, рок.'].fillna(effective_max_dur) - target_dur_ideal) / max(target_dur_ideal, 0.01)
+            candidates['total_score'] = candidates['ytm_score'] * 0.6 + candidates['dur_score'] * 0.4
+            candidates = candidates.sort_values('total_score', ascending=False)
+
+            # Take top N candidates (up to 5, or all if fewer)
+            top_n = min(5, len(candidates))
+            top_candidates = candidates.head(top_n).copy()
+
+            # ── Step 3: Allocate pool across candidates ───────────────────────
+            # Weight allocation proportional to total_score (shifted to be positive)
+            scores = top_candidates['total_score'].values
+            shifted = scores - scores.min() + 0.01   # ensure all positive
+            weights = shifted / shifted.sum()
+            top_candidates['alloc_uah'] = weights * sell_pool_uah
+            top_candidates['alloc_qty'] = (
+                top_candidates['alloc_uah'] / top_candidates['sell_price'].replace(0, np.nan)
+            ).apply(lambda x: max(1, int(x)) if pd.notna(x) else 0)
+            # Recalculate actual spend based on integer qty
+            top_candidates['actual_spend'] = top_candidates['alloc_qty'] * top_candidates['sell_price']
+            total_actual_spend = top_candidates['actual_spend'].sum()
+            remainder = sell_pool_uah - total_actual_spend
+
+            # Show allocation table
+            alloc_display = top_candidates[[
+                'isin', 'name', 'sell_rate', 'sell_type',
+                'Дюрація Макколея, рок.', 'sell_price', 'maturity',
+                'alloc_qty', 'actual_spend',
+            ]].copy()
+            alloc_display.columns = [
+                'ISIN', 'Назва', 'YTM/SIM, %', 'Тип',
+                'Дюрація, рок.', 'Ціна ICU, ₴', 'Погашення',
+                'К-сть (шт.)', 'Сума покупки, ₴',
+            ]
+            st.dataframe(alloc_display, hide_index=True, use_container_width=True,
+                         column_config={
+                             'Погашення': st.column_config.DateColumn(format="DD.MM.YYYY"),
+                             'YTM/SIM, %': st.column_config.NumberColumn(format="%.2f%%"),
+                             'Дюрація, рок.': st.column_config.NumberColumn(format="%.2f"),
+                             'Ціна ICU, ₴': st.column_config.NumberColumn(format="₴%.2f"),
+                             'К-сть (шт.)': st.column_config.NumberColumn(format="%d шт."),
+                             'Сума покупки, ₴': st.column_config.NumberColumn(format="₴%.2f"),
+                         })
+
+            # Summary of pool allocation
+            col_pool1, col_pool2, col_pool3 = st.columns(3)
+            col_pool1.markdown(f"""<div class='metric-card' style='border-left-color:#ef5350;'>
+                <h4>💰 Пул до розміщення</h4><p>₴{sell_pool_uah:,.2f}</p></div>""",
+                unsafe_allow_html=True)
+            col_pool2.markdown(f"""<div class='metric-card' style='border-left-color:#66bb6a;'>
+                <h4>✅ Витрачено</h4><p>₴{total_actual_spend:,.2f}</p></div>""",
+                unsafe_allow_html=True)
+            col_pool3.markdown(f"""<div class='metric-card' style='border-left-color:#ffb74d;'>
+                <h4>🪙 Залишок (не кратно ціні)</h4><p>₴{remainder:,.2f}</p></div>""",
+                unsafe_allow_html=True)
+
+            # Allocation pie chart
+            fig_alloc = go.Figure(go.Pie(
+                labels=alloc_display['Назва'].fillna(alloc_display['ISIN']),
+                values=top_candidates['actual_spend'],
+                hole=0.42,
+                marker=dict(colors=px.colors.qualitative.Safe),
+                textinfo='label+percent',
+                hovertemplate='%{label}<br>₴%{value:,.2f}<extra></extra>',
+            ))
+            fig_alloc.update_layout(
+                template='plotly_dark',
+                title='Розподіл пулу між новими облігаціями',
+                margin=dict(t=50, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_alloc, use_container_width=True)
+
+            st.divider()
+
+            # ── Step 4: Build simulated post-rebalance portfolio ──────────────
+            st.subheader("📐 Прогноз портфеля після ребалансування")
+            st.caption(
+                "Зберігаємо «здорові» позиції без змін, "
+                "продаємо проблемні і купуємо нові відповідно до розподілу вище."
+            )
+
             sim_holdings = []
-            swap_map = {s['sell_isin']: s for s in best_swaps}
+            # Keep clean positions as-is
             for h in holdings:
-                isin = h['isin']
-                if isin in swap_map:
-                    sim_holdings.append({
-                        'isin': swap_map[isin]['buy_isin'],
-                        'quantity': h['quantity'],
-                        'avg_buy_price': swap_map[isin]['buy_price'] or h.get('avg_buy_price'),
-                    })
-                else:
+                if h['isin'] in keep_isins:
                     sim_holdings.append(h)
+            # Add new buy positions
+            for _, row in top_candidates.iterrows():
+                qty = int(row['alloc_qty'])
+                if qty > 0:
+                    sim_holdings.append({
+                        'isin': row['isin'],
+                        'quantity': qty,
+                        'avg_buy_price': float(row['sell_price']),
+                    })
 
             sim_portfolio_df = build_portfolio_df(sim_holdings, mdf)
             sim_summary = portfolio_summary(sim_portfolio_df)
@@ -857,9 +889,6 @@ with tab_analysis:
                     'DV01 портфеля, ₴',
                     'Річний купон. дохід, ₴',
                 ]
-                before_vals = {k: summary.get(k, 0) for k in compare_keys}
-                after_vals  = {k: sim_summary.get(k, 0) for k in compare_keys}
-
                 labels = {
                     'Серед. зважений YTM, %': 'Серед. YTM, %',
                     'Серед. зважена дюрація (Маккол.), рок.': 'Дюрація (Маккол.), рок.',
@@ -867,6 +896,11 @@ with tab_analysis:
                     'DV01 портфеля, ₴': 'DV01, ₴',
                     'Річний купон. дохід, ₴': 'Річний купон. дохід, ₴',
                 }
+                # Keys where higher = better
+                higher_is_better = {'Серед. зважений YTM, %', 'Річний купон. дохід, ₴'}
+
+                before_vals = {k: float(summary.get(k, 0) or 0) for k in compare_keys}
+                after_vals  = {k: float(sim_summary.get(k, 0) or 0) for k in compare_keys}
 
                 cmp_cols = st.columns(len(compare_keys))
                 for col, k in zip(cmp_cols, compare_keys):
@@ -875,10 +909,8 @@ with tab_analysis:
                     delta = av - bv
                     delta_str = f"{'+' if delta >= 0 else ''}{delta:.2f}"
                     arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
-                    # For YTM up is good; for DV01/duration, depends on goal
-                    is_good_up = k in ('Серед. зважений YTM, %', 'Річний купон. дохід, ₴')
-                    good = (delta > 0) == is_good_up
-                    clr = "#66bb6a" if (delta > 0 and is_good_up) or (delta < 0 and not is_good_up) else "#ef5350" if delta != 0 else "#aaa"
+                    improving = (delta > 0 and k in higher_is_better) or (delta < 0 and k not in higher_is_better)
+                    clr = "#66bb6a" if (delta != 0 and improving) else "#ef5350" if delta != 0 else "#aaa"
                     col.markdown(f"""
 <div class='metric-card'>
   <h4>{labels[k]}</h4>
@@ -888,21 +920,20 @@ with tab_analysis:
 
                 st.divider()
 
-                # Side-by-side bar chart: Before vs After key metrics
-                import plotly.graph_objects as go
-
+                # Before vs After grouped bar chart (first 3 metrics)
+                chart_keys = compare_keys[:3]
                 fig_cmp = go.Figure()
-                metric_labels = [labels[k] for k in compare_keys[:3]]  # first 3 for chart clarity
-                before_plot = [before_vals[k] for k in compare_keys[:3]]
-                after_plot  = [after_vals[k]  for k in compare_keys[:3]]
-
                 fig_cmp.add_trace(go.Bar(
-                    name='Зараз', x=metric_labels, y=before_plot,
-                    marker_color='#ef5350', opacity=0.85
+                    name='Зараз',
+                    x=[labels[k] for k in chart_keys],
+                    y=[before_vals[k] for k in chart_keys],
+                    marker_color='#ef5350', opacity=0.85,
                 ))
                 fig_cmp.add_trace(go.Bar(
-                    name='Після ребалансування', x=metric_labels, y=after_plot,
-                    marker_color='#66bb6a', opacity=0.85
+                    name='Після ребалансування',
+                    x=[labels[k] for k in chart_keys],
+                    y=[after_vals[k] for k in chart_keys],
+                    marker_color='#66bb6a', opacity=0.85,
                 ))
                 fig_cmp.update_layout(
                     barmode='group',
@@ -913,8 +944,6 @@ with tab_analysis:
                     margin=dict(t=60, b=30),
                 )
                 st.plotly_chart(fig_cmp, use_container_width=True)
-        else:
-            st.info("Немає рекомендованих замін — нічого симулювати.")
 
     st.divider()
 
