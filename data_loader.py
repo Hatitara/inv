@@ -14,8 +14,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 from datetime import date, datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -374,7 +375,266 @@ def parse_portfolio_csv(raw: str | bytes) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. ДЕМО-ДАНІ (для тестування без реального портфеля)
+# 5. INTERACTIVE BROKERS — Account Statement / Activity Statement (CSV)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ib_find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Повертає першу колонку df, що збігається (case-insensitive) з candidates."""
+    cols = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower().strip()
+        if key in cols:
+            return cols[key]
+    return None
+
+
+def _ib_to_float(val) -> float:
+    """str → float: прибирає коми, пробіли, знак %."""
+    try:
+        return float(str(val).replace(",", "").replace(" ", "").replace("%", ""))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _ib_parse_description(desc: str) -> Tuple[float, Optional[pd.Timestamp]]:
+    """
+    Витягує купон і дату погашення з текстового поля Description IB.
+    Підтримує формати:
+      '14.5% 15OCT2025'  '14.500 15/10/2025'  '0% DISC 01SEP2025'
+      'UA Govt 16% 01MAR2026'
+    """
+    coupon = 0.0
+    maturity = None
+
+    m = re.search(r"(\d+[.,]?\d*)\s*%", desc)
+    if m:
+        coupon = float(m.group(1).replace(",", "."))
+
+    # DDMMMYYYY (01OCT2025)
+    m = re.search(r"(\d{1,2})([A-Z]{3})(\d{4})", desc.upper())
+    if m:
+        try:
+            maturity = pd.to_datetime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", format="%d %b %Y",
+                errors="coerce",
+            )
+        except Exception:
+            pass
+
+    # DD/MM/YYYY або YYYY-MM-DD
+    if maturity is None or pd.isnull(maturity):
+        m = re.search(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", desc)
+        if m:
+            maturity = pd.to_datetime(
+                desc[m.start(): m.end()], dayfirst=True, errors="coerce"
+            )
+
+    return coupon, (maturity if maturity is not None and not pd.isnull(maturity) else None)
+
+
+def _ib_split_sections(raw: str) -> Dict[str, pd.DataFrame]:
+    """
+    Розбиває IB Activity Statement CSV на словник секцій.
+    Формат рядка: SectionName,Header|Data,col1,col2,...
+
+    Повертає {section_name: DataFrame}.
+    """
+    sections: Dict[str, list] = {}      # name -> list of rows
+    headers:  Dict[str, List[str]] = {} # name -> column names
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+
+        section, row_type = parts[0], parts[1]
+        rest = parts[2:]
+
+        if row_type == "Header":
+            headers[section] = rest
+            sections.setdefault(section, [])
+        elif row_type == "Data":
+            cols = headers.get(section)
+            if cols is None:
+                continue
+            # Вирівнюємо довжину
+            row = rest + [""] * max(0, len(cols) - len(rest))
+            sections[section].append(row[: len(cols)])
+
+    return {
+        name: pd.DataFrame(rows, columns=headers[name])
+        for name, rows in sections.items()
+        if name in headers and rows
+    }
+
+
+def parse_ib_statement(
+    raw: str | bytes,
+) -> Tuple[List[Dict], pd.DataFrame]:
+    """
+    Парсить Activity Statement / Account Statement з Interactive Brokers (CSV).
+
+    Читає:
+      • «Open Positions»  (Asset Category = Bonds) → реєстр паперів + позиції
+      • «Trades»          (Asset Category = Bonds) → дати першої купівлі
+
+    Повертає:
+      bonds_list   — список dict для parse_bond_registry_from_dict()
+      portfolio_df — DataFrame для відображення / подальшого аналізу
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    sections = _ib_split_sections(raw)
+    today = date.today()
+
+    # ── Open Positions ────────────────────────────────────────────────────────
+    bonds_list:     List[Dict] = []
+    portfolio_rows: List[Dict] = []
+
+    pos_df = sections.get("Open Positions")
+    if pos_df is not None and not pos_df.empty:
+        # Фільтрація тільки облігацій
+        cat_col = _ib_find_col(pos_df, ["Asset Category", "Asset_Category", "assetCategory"])
+        if cat_col:
+            pos_df = pos_df[pos_df[cat_col].str.strip().str.lower() == "bonds"]
+
+        isin_col     = _ib_find_col(pos_df, ["ISIN", "isin"])
+        symbol_col   = _ib_find_col(pos_df, ["Symbol", "symbol", "Ticker"])
+        desc_col     = _ib_find_col(pos_df, ["Description", "description", "Instrument"])
+        qty_col      = _ib_find_col(pos_df, ["Quantity", "quantity", "Pos"])
+        mult_col     = _ib_find_col(pos_df, ["Mult", "mult", "Multiplier", "FaceValue"])
+        cost_col     = _ib_find_col(pos_df, ["Cost Price", "CostPrice", "Avg Cost", "AvgCost"])
+        price_col    = _ib_find_col(pos_df, ["Close Price", "ClosePrice", "Mark Price", "Price"])
+        ccy_col      = _ib_find_col(pos_df, ["Currency", "currency", "Curr"])
+        coupon_col   = _ib_find_col(pos_df, ["Coupon", "coupon", "Coupon Rate", "CouponRate"])
+        maturity_col = _ib_find_col(pos_df, ["Maturity Date", "MaturityDate", "Expiry", "Maturity"])
+        ytm_col      = _ib_find_col(pos_df, ["Yield", "YTM", "Accrued YTM"])
+
+        for _, row in pos_df.iterrows():
+            try:
+                # ISIN
+                isin = str(row[isin_col]).strip().upper() if isin_col else ""
+                if not isin or isin in ("NAN", ""):
+                    sym = str(row[symbol_col]).strip().upper() if symbol_col else ""
+                    isin = sym if len(sym) >= 12 else ""
+                if len(isin) < 12:
+                    continue
+
+                ccy = str(row[ccy_col]).strip().upper() if ccy_col else "UAH"
+                if ccy not in ("UAH", "USD", "EUR"):
+                    ccy = "UAH"
+
+                qty = _ib_to_float(row[qty_col]) if qty_col else 0.0
+                if qty == 0:
+                    continue
+
+                mult       = _ib_to_float(row[mult_col]) if mult_col else 1000.0
+                face       = mult if mult > 1 else 1000.0
+                cost_price = _ib_to_float(row[cost_col])  if cost_col  else 100.0
+                mkt_price  = _ib_to_float(row[price_col]) if price_col else 100.0
+
+                # IB іноді дає абсолютну ціну, не %
+                if mkt_price  > 500: mkt_price  = mkt_price  / face * 100
+                if cost_price > 500: cost_price = cost_price / face * 100
+
+                # Купон і погашення — явні колонки або витяг з Description
+                coupon   = _ib_to_float(row[coupon_col]) if coupon_col else 0.0
+                maturity: Optional[pd.Timestamp] = None
+                if maturity_col:
+                    maturity = pd.to_datetime(str(row[maturity_col]), errors="coerce")
+                    if pd.isnull(maturity):
+                        maturity = None
+
+                desc = str(row[desc_col]).strip() if desc_col else ""
+                if coupon == 0 or maturity is None:
+                    c, m = _ib_parse_description(desc)
+                    if coupon == 0 and c:
+                        coupon = c
+                    if maturity is None and m is not None:
+                        maturity = m
+
+                if maturity is None or maturity.date() <= today:
+                    continue
+
+                ytm_pct = _ib_to_float(row[ytm_col]) if ytm_col else 0.0
+                freq    = 4 if coupon > 0 else 0  # ОВДП — квартально за замовчуванням
+
+                # Дату випуску не знаємо точно — беремо ~2 роки до погашення як placeholder
+                issue_approx = (maturity - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+
+                bonds_list.append({
+                    "isin":             isin,
+                    "series_code":      str(row[symbol_col]).strip() if symbol_col else isin,
+                    "currency":         ccy,
+                    "face_value":       face,
+                    "coupon_rate_pct":  coupon,
+                    "coupon_freq":      freq,
+                    "day_count":        "ACT/ACT",
+                    "issue_date":       issue_approx,
+                    "maturity_date":    maturity.strftime("%Y-%m-%d"),
+                    "market_price_pct": mkt_price,
+                    "market_ytm_pct":   ytm_pct,
+                    "volume_mln_uah":   0.0,
+                })
+                portfolio_rows.append({
+                    "isin":              isin,
+                    "amount_lots":       abs(qty),
+                    "avg_buy_price_pct": cost_price,
+                    "buy_date":          str(today),  # уточнимо з Trades нижче
+                    "commission_uah":    0.0,
+                })
+
+            except Exception as e:
+                log.debug("IB Open Positions: пропускаю рядок: %s", e)
+
+    # ── Trades → уточнення дати першої купівлі ────────────────────────────────
+    trades_df = sections.get("Trades")
+    if trades_df is not None and not trades_df.empty:
+        cat_col2 = _ib_find_col(trades_df, ["Asset Category", "Asset_Category"])
+        if cat_col2:
+            trades_df = trades_df[trades_df[cat_col2].str.strip().str.lower() == "bonds"]
+
+        isin_col2  = _ib_find_col(trades_df, ["ISIN", "isin"])
+        sym_col2   = _ib_find_col(trades_df, ["Symbol", "symbol"])
+        date_col   = _ib_find_col(trades_df, ["Date/Time", "DateTime", "TradeDate", "Date"])
+        bs_col     = _ib_find_col(trades_df, ["Buy/Sell", "BuySell", "Action", "Side"])
+
+        buy_dates: Dict[str, date] = {}
+        for _, row in trades_df.iterrows():
+            try:
+                bs = str(row[bs_col]).strip().upper() if bs_col else ""
+                if "BUY" not in bs and bs != "B":
+                    continue
+                isin2 = str(row[isin_col2]).strip().upper() if isin_col2 else ""
+                if not isin2 or isin2 == "NAN":
+                    sym2  = str(row[sym_col2]).strip().upper() if sym_col2 else ""
+                    isin2 = sym2 if len(sym2) >= 12 else ""
+                if len(isin2) < 12:
+                    continue
+                dt = pd.to_datetime(str(row[date_col]).strip(), errors="coerce") if date_col else None
+                if dt is None or pd.isnull(dt):
+                    continue
+                # Зберігаємо найранішу дату купівлі
+                if isin2 not in buy_dates or dt.date() < buy_dates[isin2]:
+                    buy_dates[isin2] = dt.date()
+            except Exception:
+                pass
+
+        for r in portfolio_rows:
+            if r["isin"] in buy_dates:
+                r["buy_date"] = str(buy_dates[r["isin"]])
+
+    portfolio_df = parse_portfolio_input(portfolio_rows) if portfolio_rows else pd.DataFrame()
+    log.info("IB Statement: %d паперів, %d позицій", len(bonds_list), len(portfolio_df))
+    return bonds_list, portfolio_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. ДЕМО-ДАНІ (для тестування без реального портфеля)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEMO_BONDS = [

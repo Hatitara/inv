@@ -38,7 +38,8 @@ from config import (
 from data_loader import (
     DEMO_BONDS, DEMO_PORTFOLIO,
     load_fx_rates, load_minfin_bonds, load_nbu_key_rate,
-    parse_bond_registry_from_dict, parse_portfolio_csv, parse_portfolio_input,
+    parse_bond_registry_from_dict, parse_ib_statement,
+    parse_portfolio_csv, parse_portfolio_input,
 )
 from recommender import StrategyParams, run_recommendations
 
@@ -690,6 +691,35 @@ with tab_recs:
 
 with tab_settings:
     st.header("⚙️ Налаштування та завантаження даних")
+
+    # Interactive Brokers — завантажує і реєстр, і портфель одночасно
+    with st.expander("🏦 Interactive Brokers — Activity Statement", expanded=False):
+        st.caption(
+            "Завантажте CSV-звіт з IB (Reports → Activity Statement або Flex Query). "
+            "Автоматично заповнює реєстр ОВДП **і** портфель з секцій «Open Positions» та «Trades»."
+        )
+        ib_file = st.file_uploader("Activity Statement CSV", type=["csv", "txt"], key="ib_upload")
+        if ib_file and st.button("📥 Імпортувати з IB", type="primary"):
+            with st.spinner("Парсинг IB Statement..."):
+                raw_bytes = ib_file.read()
+                bonds_list, port_df = parse_ib_statement(raw_bytes)
+            if not bonds_list:
+                st.error(
+                    "Не знайдено облігацій (Bonds) у секції «Open Positions». "
+                    "Перевірте що файл — Activity Statement, а не інший звіт."
+                )
+            else:
+                S["bonds_df"]   = parse_bond_registry_from_dict(bonds_list)
+                if not port_df.empty:
+                    S["portfolio_df"] = port_df
+                st.success(
+                    f"✅ IB: {len(S['bonds_df'])} паперів, "
+                    f"{len(S['portfolio_df'])} позицій портфеля"
+                )
+                if S["bonds_df"].empty:
+                    st.warning("Реєстр порожній — можливо, купон або дата погашення не розпізнані з Description.")
+
+    st.divider()
 
     # Реєстр облігацій
     with st.expander("📋 Реєстр облігацій (dim_bonds)", expanded=True):
